@@ -4,10 +4,6 @@
 #ifndef CREDENTIALS_H
 #define CREDENTIALS_H
 
-// ---------- CONFIGURACION WIFI ----------
-const char* WIFI_SSID     = "tu_wifi_ssid";
-const char* WIFI_PASSWORD = "tu_wifi_password";
-
 // ---------- CONFIGURACION MQTT ----------
 const char* MQTT_HOST     = "tu_broker.emqxsl.com";
 const int   MQTT_PORT     = 8883;

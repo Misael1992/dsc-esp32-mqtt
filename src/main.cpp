@@ -7,38 +7,35 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <ArduinoOTA.h>
+#include <WiFiManager.h>  // Librería para configuración WiFi
 
 // ---------- INCLUIR CREDENCIALES ----------
 #include "credentials.h"
 
 // ---------- CONFIGURACION DINAMICA ----------
-// deviceId se genera automáticamente desde la MAC
 String deviceId = "dsc_" + String((uint32_t)ESP.getEfuseMac(), HEX);
-const char* MQTT_USER = deviceId.c_str();  // Username = deviceId
+const char* MQTT_USER = deviceId.c_str();
 
-// ---------- TOPICOS DINAMICOS CON DEVICEID ----------
-String TOPIC_STATE;      // dsc/{deviceId}/state
-String TOPIC_EVENT;      // dsc/{deviceId}/event
+// ---------- TOPICOS DINAMICOS ----------
+String TOPIC_STATE;
+String TOPIC_EVENT;
 
 // ---------- PINES KEYBUS ----------
 #define DSC_CLOCK_PIN 18
 #define DSC_READ_PIN  19
 #define DSC_WRITE_PIN 21
 
-// ---------- TIMERS PARA AGRUPAR MENSAJES ----------
-const unsigned long PUBLISH_INTERVAL = 200;  // 200ms de intervalo para agrupar cambios
+// ---------- TIMERS ----------
+const unsigned long PUBLISH_INTERVAL = 200;
 unsigned long lastPublishTime = 0;
 bool pendingUpdate = false;
 
-// ---------- CONFIGURACION NTP AVANZADA ----------
-// Zona horaria para Ecuador (UTC-5)
-// Formato: "EST5" para UTC-5 sin horario de verano
+// ---------- NTP ----------
 const char* NTP_SERVER = "pool.ntp.org";
-const long  GMT_OFFSET_SEC = -18000;  // UTC-5 para Ecuador
-const int   DAYLIGHT_OFFSET_SEC = 0;  // Ecuador NO tiene horario de verano
-
+const long  GMT_OFFSET_SEC = -18000;  // UTC-5 Ecuador
+const int   DAYLIGHT_OFFSET_SEC = 0;
 unsigned long lastNTPSync = 0;
-const unsigned long NTP_SYNC_INTERVAL = 3600000; // Sincronizar cada hora
+const unsigned long NTP_SYNC_INTERVAL = 3600000;
 bool timeInitialized = false;
 
 // ---------- OBJETOS ----------
@@ -48,15 +45,16 @@ PubSubClient mqtt(secureClient);
 StaticJsonDocument<512> jsonDoc;
 unsigned long lastReconnectAttempt = 0;
 
-// Variables para detectar cambios específicos
+// Variables para control de reinicio
+unsigned long lastWiFiCheck = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 60000; // Verificar WiFi cada minuto
+bool wifiConfigMode = false;
+
+// ---------- ESTRUCTURA DE CAMBIOS ----------
 struct StateChange {
   bool partitionChanged[4];
   bool zonesChanged;
   bool keybusChanged;
-  
-  StateChange() {
-    reset();
-  }
   
   void reset() {
     memset(partitionChanged, 0, sizeof(partitionChanged));
@@ -69,7 +67,7 @@ StateChange stateChange;
 
 // Variables para debug
 unsigned long lastDebugPrint = 0;
-const unsigned long DEBUG_PRINT_INTERVAL = 30000; // Debug cada 30 segundos
+const unsigned long DEBUG_PRINT_INTERVAL = 30000;
 
 // ---------- PROTOTIPOS ----------
 void mqttCallback(char* topic, byte* payload, unsigned int length);
@@ -82,6 +80,8 @@ void printDebugInfo();
 void initNTP();
 String getFormattedTime();
 unsigned long getUnixTimestamp();
+bool setupWiFi();
+void checkWiFiConnection();
 
 // ===============================
 void setup() {
@@ -92,32 +92,17 @@ void setup() {
   Serial.println("Iniciando sistema DSC MQTT");
   Serial.println("=========================================");
 
-  // Configurar tópicos con deviceId único
+  // Configurar tópicos
   setupTopics();
 
-  // Conexión WiFi
-  Serial.println("\n[WiFi] Conectando a red...");
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  
-  int wifiAttempts = 0;
-  while (WiFi.status() != WL_CONNECTED && wifiAttempts < 20) {
-    delay(500);
-    Serial.print(".");
-    wifiAttempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WiFi] Conectado exitosamente!");
-    Serial.print("[WiFi] IP: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("[WiFi] MAC: ");
-    Serial.println(WiFi.macAddress());
-  } else {
-    Serial.println("\n[WiFi] Error: No se pudo conectar");
+  // Configurar WiFi con WiFiManager
+  if (!setupWiFi()) {
+    Serial.println("[WiFi] Error crítico, reiniciando...");
+    delay(3000);
+    ESP.restart();
   }
 
-  // Inicializar NTP (versión mejorada)
+  // Inicializar NTP
   initNTP();
 
   // Configuración MQTT
@@ -129,17 +114,14 @@ void setup() {
   mqtt.setBufferSize(1024);
 
   // Configurar OTA
-  Serial.println("\n[OTA] Configurando actualizaciones Over-The-Air...");
+  Serial.println("\n[OTA] Configurando actualizaciones...");
   ArduinoOTA.setHostname(deviceId.c_str());
   ArduinoOTA.setPassword("1234");
   
   ArduinoOTA.onStart([]() {
     String type;
-    if (ArduinoOTA.getCommand() == U_FLASH) {
-      type = "sketch";
-    } else {
-      type = "filesystem";
-    }
+    if (ArduinoOTA.getCommand() == U_FLASH) type = "sketch";
+    else type = "filesystem";
     Serial.println("\n[OTA] Iniciando actualización de " + type);
   });
   
@@ -161,7 +143,7 @@ void setup() {
   });
   
   ArduinoOTA.begin();
-  Serial.println("[OTA] Listo - Esperando actualizaciones");
+  Serial.println("[OTA] Listo");
 
   // Iniciar comunicación con DSC
   Serial.println("\n[DSC] Iniciando comunicación con Keybus...");
@@ -171,6 +153,86 @@ void setup() {
   Serial.println("\n=========================================");
   Serial.println("Sistema iniciado correctamente!");
   Serial.println("=========================================\n");
+  
+  // Publicar evento de inicio
+  publishEvent("system_start", 0, 0);
+}
+
+// ===============================
+bool setupWiFi() {
+  Serial.println("\n[WiFi] Configurando WiFi Manager...");
+  
+  // Crear instancia de WiFiManager
+  WiFiManager wifiManager;
+  
+  // Configurar timeout para modo portal (3 minutos)
+  wifiManager.setConfigPortalTimeout(180);
+  
+  // Configurar AP name con el deviceId
+  String apName = "DSC_" + deviceId;
+  
+  Serial.print("[WiFi] AP Name: ");
+  Serial.println(apName);
+  
+  // Intentar conectar automáticamente
+  if (wifiManager.autoConnect(apName.c_str(), "dsc12345")) {
+    Serial.println("[WiFi] Conectado exitosamente!");
+    Serial.print("[WiFi] IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("[WiFi] MAC: ");
+    Serial.println(WiFi.macAddress());
+    Serial.print("[WiFi] SSID: ");
+    Serial.println(WiFi.SSID());
+    return true;
+  } else {
+    Serial.println("[WiFi] Error: No se pudo conectar");
+    return false;
+  }
+}
+
+// ===============================
+void checkWiFiConnection() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Conexión perdida, intentando reconectar...");
+    WiFi.reconnect();
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      attempts++;
+      Serial.print(".");
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n[WiFi] Reconectado exitosamente!");
+      publishEvent("wifi_reconnected", 0, 0);
+    } else {
+      Serial.println("\n[WiFi] Error: No se pudo reconectar");
+      Serial.println("[WiFi] Activando modo configuración...");
+      
+      // Forzar modo portal para reconectar
+      WiFiManager wifiManager;
+      wifiManager.setConfigPortalTimeout(120);
+      String apName = "DSC_" + deviceId;
+      wifiManager.startConfigPortal(apName.c_str(), "dsc12345");
+      
+      // Después del portal, reiniciar
+      Serial.println("[WiFi] Reiniciando para aplicar cambios...");
+      delay(2000);
+      ESP.restart();
+    }
+  }
+}
+
+// ===============================
+void setupTopics() {
+  TOPIC_STATE = "dsc/" + deviceId + "/state";
+  TOPIC_EVENT = "dsc/" + deviceId + "/event";
+  
+  Serial.println("=== Topics configurados ===");
+  Serial.print("State: "); Serial.println(TOPIC_STATE);
+  Serial.print("Event: "); Serial.println(TOPIC_EVENT);
+  Serial.print("Device ID: "); Serial.println(deviceId);
 }
 
 // ===============================
@@ -180,7 +242,6 @@ void initNTP() {
   
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
   
-  // Esperar hasta 10 segundos para obtener la hora
   int attempts = 0;
   struct tm timeinfo;
   while (!getLocalTime(&timeinfo, 1000) && attempts < 10) {
@@ -198,20 +259,16 @@ void initNTP() {
     Serial.println(timeString);
   } else {
     timeInitialized = false;
-    Serial.println("\n[NTP] Advertencia: No se pudo sincronizar, usando millis()");
+    Serial.println("\n[NTP] Advertencia: No se pudo sincronizar");
   }
 }
 
 // ===============================
 String getFormattedTime() {
-  if (!timeInitialized) {
-    return String(millis());
-  }
+  if (!timeInitialized) return String(millis());
   
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    return String(millis());
-  }
+  if (!getLocalTime(&timeinfo)) return String(millis());
   
   char timeString[64];
   strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
@@ -220,44 +277,33 @@ String getFormattedTime() {
 
 // ===============================
 unsigned long getUnixTimestamp() {
-  if (!timeInitialized) {
-    return millis() / 1000;
-  }
+  if (!timeInitialized) return millis() / 1000;
   
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    return millis() / 1000;
-  }
+  if (!getLocalTime(&timeinfo)) return millis() / 1000;
   
   time_t t = mktime(&timeinfo);
   return (unsigned long)t;
 }
 
 // ===============================
-void setupTopics() {
-  TOPIC_STATE = "dsc/" + deviceId + "/state";
-  TOPIC_EVENT = "dsc/" + deviceId + "/event";
-  
-  Serial.println("=== Topics configurados ===");
-  Serial.print("State: "); Serial.println(TOPIC_STATE);
-  Serial.print("Event: "); Serial.println(TOPIC_EVENT);
-  Serial.print("Device ID: "); Serial.println(deviceId);
-}
-
-// ===============================
 void loop() {
+  // Verificar conexión WiFi periódicamente
+  if (millis() - lastWiFiCheck >= WIFI_CHECK_INTERVAL) {
+    lastWiFiCheck = millis();
+    checkWiFiConnection();
+  }
+  
   // Manejar OTA
   ArduinoOTA.handle();
   
-  // Sincronizar NTP periódicamente
+  // Sincronizar NTP
   if (millis() - lastNTPSync >= NTP_SYNC_INTERVAL) {
     lastNTPSync = millis();
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 2000)) {
       timeInitialized = true;
-      Serial.println("[NTP] Tiempo resincronizado correctamente");
-    } else {
-      Serial.println("[NTP] Error al resincronizar");
+      Serial.println("[NTP] Tiempo resincronizado");
     }
   }
   
@@ -283,18 +329,18 @@ void loop() {
 
   dsc.loop();
 
-  // Detectar cambios y marcar para actualización
+  // Detectar cambios Keybus
   if (dsc.statusChanged) {
     dsc.statusChanged = false;
     stateChange.keybusChanged = true;
     pendingUpdate = true;
-    Serial.println("[DSC] Cambio detectado: Estado del Keybus");
+    Serial.println("[DSC] Cambio: Estado Keybus");
   }
 
   if (dsc.accessCodePrompt) {
     dsc.accessCodePrompt = false;
     dsc.write(ACCESS_CODE);
-    Serial.println("[DSC] Enviando código de acceso al panel");
+    Serial.println("[DSC] Enviando código de acceso");
   }
 
   // Detectar cambios en particiones
@@ -342,13 +388,12 @@ void loop() {
     }
   }
 
-  // Publicar estado agrupado si hay cambios pendientes
+  // Publicar estado agrupado
   if (pendingUpdate && (millis() - lastPublishTime >= PUBLISH_INTERVAL)) {
     publishState();
     pendingUpdate = false;
     stateChange.reset();
     lastPublishTime = millis();
-    Serial.println("[MQTT] Estado publicado (cambios agrupados)");
   }
 }
 
@@ -359,98 +404,71 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   StaticJsonDocument<128> doc;
   DeserializationError error = deserializeJson(doc, payload, length);
   if (error) {
-    Serial.println("[MQTT] Error al parsear comando JSON");
+    Serial.println("[MQTT] Error parsing command");
     return;
   }
   
   const char* cmd = doc["cmd"];
   byte partition = doc["partition"] | 1;
   
-  if (!cmd) {
-    Serial.println("[MQTT] Comando sin campo 'cmd'");
-    return;
-  }
-  
+  if (!cmd) return;
   partition--;
-  if (partition > 3) {
-    Serial.println("[MQTT] Partición inválida");
-    return;
-  }
+  if (partition > 3) return;
   
-  Serial.printf("[MQTT] Comando recibido: %s para partición %d\n", cmd, partition + 1);
+  Serial.printf("[MQTT] Comando: %s para partición %d\n", cmd, partition + 1);
   
   if (strcmp(cmd, "arm") == 0 && dsc.ready[partition]) {
     dsc.writePartition = partition + 1;
     dsc.write('w');
     publishEvent("arming", 0, partition);
-    Serial.printf("[DSC] Ejecutando ARM en partición %d\n", partition + 1);
   }
   else if (strcmp(cmd, "stay") == 0 && dsc.ready[partition]) {
     dsc.writePartition = partition + 1;
     dsc.write('s');
     publishEvent("stay_arming", 0, partition);
-    Serial.printf("[DSC] Ejecutando STAY ARM en partición %d\n", partition + 1);
   }
   else if (strcmp(cmd, "disarm") == 0 && (dsc.armed[partition] || dsc.alarm[partition])) {
     dsc.writePartition = partition + 1;
     dsc.write(ACCESS_CODE);
     publishEvent("disarming", 0, partition);
-    Serial.printf("[DSC] Ejecutando DISARM en partición %d\n", partition + 1);
-  }
-  else {
-    Serial.printf("[MQTT] Comando '%s' ignorado (condiciones no cumplidas)\n", cmd);
   }
 }
 
 // ===============================
 void publishState() {
-  if (!mqtt.connected()) {
-    Serial.println("[MQTT] No se puede publicar estado: desconectado");
-    return;
-  }
+  if (!mqtt.connected()) return;
   
   jsonDoc.clear();
   updateStateJson();
   
   char buffer[512];
   size_t len = serializeJson(jsonDoc, buffer);
-  
-  if (mqtt.publish(TOPIC_STATE.c_str(), (const uint8_t*)buffer, len, true)) {
-    // Serial.println("[MQTT] Estado publicado correctamente");
-  } else {
-    Serial.println("[MQTT] Error al publicar estado");
-  }
+  mqtt.publish(TOPIC_STATE.c_str(), (const uint8_t*)buffer, len, true);
 }
 
 // ===============================
 void publishEvent(const char* eventType, byte zone, byte partition) {
-  if (!mqtt.connected()) {
-    Serial.println("[MQTT] No se puede publicar evento: desconectado");
-    return;
-  }
+  if (!mqtt.connected()) return;
   
   jsonDoc.clear();
   jsonDoc["event"] = eventType;
-  jsonDoc["timestamp"] = getUnixTimestamp();  // Usar timestamp Unix real
+  jsonDoc["timestamp"] = getUnixTimestamp();
   
   if (zone > 0) jsonDoc["zone"] = zone;
   if (partition > 0) jsonDoc["partition"] = partition + 1;
   
   char buffer[256];
   size_t len = serializeJson(jsonDoc, buffer);
-  
-  if (mqtt.publish(TOPIC_EVENT.c_str(), (const uint8_t*)buffer, len, true)) {
-    // Serial.printf("[MQTT] Evento '%s' publicado\n", eventType);
-  } else {
-    Serial.printf("[MQTT] Error al publicar evento '%s'\n", eventType);
-  }
+  mqtt.publish(TOPIC_EVENT.c_str(), (const uint8_t*)buffer, len, true);
 }
 
 // ===============================
 void updateStateJson() {
   jsonDoc["device_id"] = deviceId;
-  jsonDoc["timestamp"] = getUnixTimestamp();  // Usar timestamp Unix real
+  jsonDoc["timestamp"] = getUnixTimestamp();
   jsonDoc["keybus"] = dsc.keybusConnected ? 1 : 0;
+  jsonDoc["wifi_ssid"] = WiFi.SSID();
+  jsonDoc["rssi"] = WiFi.RSSI();
   
   JsonArray partitions = jsonDoc.createNestedArray("partitions");
   for (byte p = 0; p < 4; p++) {
@@ -462,15 +480,10 @@ void updateStateJson() {
     
     JsonObject part = partitions.createNestedObject();
     
-    if (dsc.alarm[p]) {
-      part["state"] = "alarm";
-    } else if (!dsc.armed[p]) {
-      part["state"] = "disarmed";
-    } else if (dsc.armedAway[p]) {
-      part["state"] = "armed_away";
-    } else if (dsc.armedStay[p]) {
-      part["state"] = "armed_home";
-    }
+    if (dsc.alarm[p]) part["state"] = "alarm";
+    else if (!dsc.armed[p]) part["state"] = "disarmed";
+    else if (dsc.armedAway[p]) part["state"] = "armed_away";
+    else if (dsc.armedStay[p]) part["state"] = "armed_home";
     
     part["ready"] = dsc.ready[p] ? 1 : 0;
   }
@@ -490,7 +503,7 @@ void updateStateJson() {
 bool mqttConnect() {
   const char* lwtMessage = "{\"keybus\":0}";
   
-  Serial.printf("[MQTT] Intentando conectar a %s:%d como %s\n", MQTT_HOST, MQTT_PORT, deviceId.c_str());
+  Serial.printf("[MQTT] Conectando a %s:%d como %s\n", MQTT_HOST, MQTT_PORT, deviceId.c_str());
   
   if (mqtt.connect(deviceId.c_str(), MQTT_USER, MQTT_PASS,
                    TOPIC_STATE.c_str(), 0, true, lwtMessage)) {
@@ -498,11 +511,10 @@ bool mqttConnect() {
     Serial.println("[MQTT] Conexión exitosa!");
     publishState();
     mqtt.subscribe(TOPIC_EVENT.c_str());
-    Serial.printf("[MQTT] Suscrito a: %s\n", TOPIC_EVENT.c_str());
     return true;
   }
   
-  Serial.printf("[MQTT] Error de conexión, rc=%d\n", mqtt.state());
+  Serial.printf("[MQTT] Error, rc=%d\n", mqtt.state());
   return false;
 }
 
@@ -510,7 +522,11 @@ bool mqttConnect() {
 void printDebugInfo() {
   Serial.println("\n========== DEBUG INFO ==========");
   Serial.printf("Uptime: %lu segundos\n", millis() / 1000);
-  Serial.printf("WiFi: %s (RSSI: %d dBm)\n", WiFi.status() == WL_CONNECTED ? "Conectado" : "Desconectado", WiFi.RSSI());
+  Serial.printf("WiFi: %s (RSSI: %d dBm)\n", 
+                WiFi.status() == WL_CONNECTED ? "Conectado" : "Desconectado", 
+                WiFi.RSSI());
+  Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
+  Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
   Serial.printf("MQTT: %s\n", mqtt.connected() ? "Conectado" : "Desconectado");
   Serial.printf("NTP: %s\n", timeInitialized ? "Sincronizado" : "No sincronizado");
   if (timeInitialized) {
@@ -518,6 +534,5 @@ void printDebugInfo() {
   }
   Serial.printf("Keybus: %s\n", dsc.keybusConnected ? "Online" : "Offline");
   Serial.printf("Memoria libre: %d bytes\n", ESP.getFreeHeap());
-  Serial.printf("Memoria PSRAM: %d bytes\n", ESP.getPsramSize());
   Serial.println("================================\n");
 }
