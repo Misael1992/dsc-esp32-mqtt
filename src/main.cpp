@@ -7,7 +7,7 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <ArduinoOTA.h>
-#include <WiFiManager.h>  // Librería para configuración WiFi
+#include <WiFiManager.h>
 
 // ---------- INCLUIR CREDENCIALES ----------
 #include "credentials.h"
@@ -24,6 +24,13 @@ String TOPIC_EVENT;
 #define DSC_CLOCK_PIN 18
 #define DSC_READ_PIN  19
 #define DSC_WRITE_PIN 21
+
+// ---------- BOTON PARA RESET WIFI ----------
+#define WIFI_RESET_BUTTON_PIN 0  // GPIO0 (FLASH button en la mayoría de ESP32)
+#define BUTTON_PRESS_TIME 3000   // 3 segundos para activar reset
+unsigned long buttonPressStart = 0;
+bool buttonPressed = false;
+bool resetWiFiConfig = false;
 
 // ---------- TIMERS ----------
 const unsigned long PUBLISH_INTERVAL = 200;
@@ -48,7 +55,6 @@ unsigned long lastReconnectAttempt = 0;
 // Variables para control de reinicio
 unsigned long lastWiFiCheck = 0;
 const unsigned long WIFI_CHECK_INTERVAL = 60000; // Verificar WiFi cada minuto
-bool wifiConfigMode = false;
 
 // ---------- ESTRUCTURA DE CAMBIOS ----------
 struct StateChange {
@@ -82,6 +88,7 @@ String getFormattedTime();
 unsigned long getUnixTimestamp();
 bool setupWiFi();
 void checkWiFiConnection();
+void checkResetButton();
 
 // ===============================
 void setup() {
@@ -92,10 +99,20 @@ void setup() {
   Serial.println("Iniciando sistema DSC MQTT");
   Serial.println("=========================================");
 
+  // Configurar botón de reset
+  pinMode(WIFI_RESET_BUTTON_PIN, INPUT_PULLUP);
+  Serial.println("[Botón] Configurado GPIO0 para reset WiFi (mantener 3 segundos)");
+
+  // Verificar si el botón está presionado al inicio
+  if (digitalRead(WIFI_RESET_BUTTON_PIN) == LOW) {
+    Serial.println("[Botón] Detectado presionado al inicio - forzando reset de WiFi");
+    resetWiFiConfig = true;
+  }
+
   // Configurar tópicos
   setupTopics();
 
-  // Configurar WiFi con WiFiManager
+  // Configurar WiFi con WiFiManager (con opción de reset)
   if (!setupWiFi()) {
     Serial.println("[WiFi] Error crítico, reiniciando...");
     delay(3000);
@@ -174,6 +191,13 @@ bool setupWiFi() {
   Serial.print("[WiFi] AP Name: ");
   Serial.println(apName);
   
+  // Si se solicitó reset de configuración
+  if (resetWiFiConfig) {
+    Serial.println("[WiFi] Reseteando configuración guardada...");
+    wifiManager.resetSettings();
+    Serial.println("[WiFi] Configuración borrada, iniciando portal de configuración");
+  }
+  
   // Intentar conectar automáticamente
   if (wifiManager.autoConnect(apName.c_str(), "dsc12345")) {
     Serial.println("[WiFi] Conectado exitosamente!");
@@ -187,6 +211,42 @@ bool setupWiFi() {
   } else {
     Serial.println("[WiFi] Error: No se pudo conectar");
     return false;
+  }
+}
+
+// ===============================
+void checkResetButton() {
+  // Leer estado del botón (LOW cuando está presionado por el pull-up)
+  bool buttonState = (digitalRead(WIFI_RESET_BUTTON_PIN) == LOW);
+  
+  if (buttonState && !buttonPressed) {
+    // Botón acaba de ser presionado
+    buttonPressed = true;
+    buttonPressStart = millis();
+    Serial.println("[Botón] Presionado - esperando 3 segundos para reset WiFi...");
+  } 
+  else if (!buttonState && buttonPressed) {
+    // Botón liberado antes de completar el tiempo
+    if (millis() - buttonPressStart < BUTTON_PRESS_TIME) {
+      Serial.println("[Botón] Liberado - reset cancelado");
+    }
+    buttonPressed = false;
+  }
+  
+  // Verificar si se mantuvo presionado el tiempo suficiente
+  if (buttonPressed && (millis() - buttonPressStart >= BUTTON_PRESS_TIME)) {
+    Serial.println("\n[Botón] Reset WiFi activado! Borrando configuración...");
+    
+    // Publicar evento de reset
+    publishEvent("wifi_reset_manual", 0, 0);
+    
+    // Borrar configuración WiFi
+    WiFiManager wifiManager;
+    wifiManager.resetSettings();
+    
+    Serial.println("[Botón] Configuración WiFi borrada, reiniciando en 2 segundos...");
+    delay(2000);
+    ESP.restart();
   }
 }
 
@@ -288,6 +348,9 @@ unsigned long getUnixTimestamp() {
 
 // ===============================
 void loop() {
+  // Verificar botón de reset WiFi
+  checkResetButton();
+  
   // Verificar conexión WiFi periódicamente
   if (millis() - lastWiFiCheck >= WIFI_CHECK_INTERVAL) {
     lastWiFiCheck = millis();
@@ -431,6 +494,14 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     dsc.writePartition = partition + 1;
     dsc.write(ACCESS_CODE);
     publishEvent("disarming", 0, partition);
+  }
+  else if (strcmp(cmd, "reset_wifi") == 0) {
+    Serial.println("[MQTT] Comando reset_wifi recibido");
+    publishEvent("wifi_reset_remote", 0, 0);
+    WiFiManager wifiManager;
+    wifiManager.resetSettings();
+    delay(1000);
+    ESP.restart();
   }
 }
 
