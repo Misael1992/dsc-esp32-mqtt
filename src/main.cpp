@@ -7,17 +7,17 @@
 #include <time.h>
 #include <ArduinoOTA.h>
 #include <WiFiManager.h>
-#include <Preferences.h>
+#include <Preferences.h>  // ← NUEVO
 
-// ---------- INCLUIR CREDENCIALES MQTT ----------
+// ---------- INCLUIR CREDENCIALES ----------
 #include "credentials.h"
 
 // ---------- CONFIGURACION DINAMICA ----------
 String deviceId = "dsc_" + String((uint32_t)ESP.getEfuseMac(), HEX);
 
-// ---------- GESTION DE CONFIGURACION ----------
+// ---------- NUEVO: GESTION DE CONFIGURACION ----------
 Preferences preferences;
-char customAccessCode[7] = "1234";     // Soporta 4-6 dígitos + null
+char customAccessCode[7] = "1234";  // Código por defecto
 
 // ---------- TOPICOS DINAMICOS ----------
 String TOPIC_STATE;
@@ -33,6 +33,7 @@ String TOPIC_EVENT;
 #define BUTTON_PRESS_TIME 5000
 unsigned long buttonPressStart = 0;
 bool buttonPressed = false;
+bool resetWiFiConfig = false;
 
 // ---------- TIMERS ----------
 const unsigned long PUBLISH_INTERVAL = 200;
@@ -87,52 +88,25 @@ unsigned long getUnixTimestamp();
 bool setupWiFi();
 void checkWiFiConnection();
 void checkResetButton();
-void saveConfig();
-void loadConfig();
+void saveConfig();   // NUEVO
+void loadConfig();   // NUEVO
 
+// ===============================
+// NUEVAS FUNCIONES PARA CONFIGURACION
 // ===============================
 void saveConfig() {
   preferences.begin("dsc_config", false);
-  
-  // Validar que el código tenga entre 4 y 6 dígitos
-  int codeLen = strlen(customAccessCode);
-  if (codeLen >= 4 && codeLen <= 6) {
-    // Verificar que solo tenga dígitos
-    bool valid = true;
-    for (int i = 0; i < codeLen; i++) {
-      if (!isdigit(customAccessCode[i])) {
-        valid = false;
-        break;
-      }
-    }
-    if (valid) {
-      preferences.putString("access_code", customAccessCode);
-      Serial.printf("[Config] Código guardado: %s (%d dígitos)\n", customAccessCode, codeLen);
-    } else {
-      preferences.putString("access_code", "1234");
-      strcpy(customAccessCode, "1234");
-      Serial.println("[Config] Código inválido (solo dígitos), usando 1234");
-    }
-  } else {
-    preferences.putString("access_code", "1234");
-    strcpy(customAccessCode, "1234");
-    Serial.println("[Config] Código inválido (4-6 dígitos), usando 1234");
-  }
-  
+  preferences.putString("access_code", customAccessCode);
   preferences.end();
+  Serial.println("[Config] Código guardado en flash");
 }
 
-// ===============================
 void loadConfig() {
   preferences.begin("dsc_config", true);
-  
   String savedCode = preferences.getString("access_code", "1234");
   strcpy(customAccessCode, savedCode.c_str());
-  
   preferences.end();
-  
-  Serial.println("[Config] Configuración cargada:");
-  Serial.printf("  Código acceso: %s (%d dígitos)\n", customAccessCode, strlen(customAccessCode));
+  Serial.printf("[Config] Código cargado: %s\n", customAccessCode);
 }
 
 // ===============================
@@ -144,6 +118,7 @@ void setup() {
   Serial.println("Iniciando sistema DSC MQTT");
   Serial.println("=========================================");
 
+  // Cargar código guardado
   loadConfig();
 
   pinMode(WIFI_RESET_BUTTON_PIN, INPUT_PULLUP);
@@ -154,10 +129,7 @@ void setup() {
     preferences.begin("dsc_config", false);
     preferences.clear();
     preferences.end();
-    WiFiManager wifiManager;
-    wifiManager.resetSettings();
-    delay(2000);
-    ESP.restart();
+    resetWiFiConfig = true;
   }
 
   setupTopics();
@@ -214,7 +186,7 @@ void setup() {
   
   Serial.println("\n=========================================");
   Serial.println("Sistema iniciado correctamente!");
-  Serial.printf("Código de acceso: %s (%d dígitos)\n", customAccessCode, strlen(customAccessCode));
+  Serial.printf("Código de acceso: %s\n", customAccessCode);
   Serial.println("=========================================\n");
   
   publishEvent("system_start", 0, 0);
@@ -238,13 +210,17 @@ bool setupWiFi() {
   Serial.print("[WiFi] AP Name: ");
   Serial.println(apName);
   
-  // Callback para guardar configuración
   wifiManager.setSaveParamsCallback([&]() {
     Serial.println("[WiFiManager] Configuración recibida, guardando código...");
     strcpy(customAccessCode, dsc_code_param.getValue());
     saveConfig();
     Serial.printf("[WiFiManager] Nuevo código: %s\n", customAccessCode);
   });
+  
+  if (resetWiFiConfig) {
+    Serial.println("[WiFi] Reseteando configuración guardada...");
+    wifiManager.resetSettings();
+  }
   
   if (wifiManager.autoConnect(apName.c_str(), "dsc12345")) {
     Serial.println("[WiFi] Conectado exitosamente!");
@@ -278,12 +254,12 @@ void checkResetButton() {
     publishEvent("factory_reset", 0, 0);
     delay(500);
     
-    WiFiManager wifiManager;
-    wifiManager.resetSettings();
-    
     preferences.begin("dsc_config", false);
     preferences.clear();
     preferences.end();
+    
+    WiFiManager wifiManager;
+    wifiManager.resetSettings();
     
     delay(2000);
     ESP.restart();
@@ -409,12 +385,8 @@ void loop() {
 
   if (dsc.accessCodePrompt) {
     dsc.accessCodePrompt = false;
-    // Enviar el código configurado dígito por dígito
-    for (int i = 0; i < strlen(customAccessCode); i++) {
-      dsc.write(customAccessCode[i]);
-      delay(50); // Pequeña pausa entre dígitos para confiabilidad
-    }
-    Serial.printf("[DSC] Código enviado: %s\n", customAccessCode);
+    dsc.write(customAccessCode);  // ← SOLO CAMBIO: antes era ACCESS_CODE
+    Serial.println("[DSC] Enviando código de acceso");
   }
 
   for (byte p = 0; p < 4; p++) {
@@ -487,45 +459,26 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   
   if (strcmp(cmd, "arm") == 0 && dsc.ready[partition]) {
     dsc.writePartition = partition + 1;
-    dsc.write('a');
+    dsc.write('w');  // ← IGUAL QUE ORIGINAL
     publishEvent("arming", 0, partition);
   }
   else if (strcmp(cmd, "stay") == 0 && dsc.ready[partition]) {
     dsc.writePartition = partition + 1;
-    dsc.write('s');
+    dsc.write('s');  // ← IGUAL QUE ORIGINAL
     publishEvent("stay_arming", 0, partition);
   }
   else if (strcmp(cmd, "disarm") == 0 && (dsc.armed[partition] || dsc.alarm[partition])) {
     dsc.writePartition = partition + 1;
-    // Usar el código configurado
-    for (int i = 0; i < strlen(customAccessCode); i++) {
-      dsc.write(customAccessCode[i]);
-      delay(50);
-    }
-    Serial.printf("[DSC] Desarmando con código: %s\n", customAccessCode);
+    dsc.write(customAccessCode);  // ← SOLO CAMBIO: antes era ACCESS_CODE
     publishEvent("disarming", 0, partition);
   }
   else if (strcmp(cmd, "reset_wifi") == 0) {
-    Serial.println("[MQTT] Reset remoto recibido");
+    Serial.println("[MQTT] Comando reset_wifi recibido");
     publishEvent("wifi_reset_remote", 0, 0);
     WiFiManager wifiManager;
     wifiManager.resetSettings();
     delay(1000);
     ESP.restart();
-  }
-  else if (strcmp(cmd, "set_code") == 0) {
-    const char* newCode = doc["code"];
-    if (newCode) {
-      int newLen = strlen(newCode);
-      if (newLen >= 4 && newLen <= 6) {
-        strcpy(customAccessCode, newCode);
-        saveConfig();
-        Serial.printf("[MQTT] Código actualizado a: %s\n", customAccessCode);
-        publishEvent("code_updated", 0, 0);
-      } else {
-        Serial.printf("[MQTT] Código inválido: debe ser 4-6 dígitos\n");
-      }
-    }
   }
 }
 
@@ -599,6 +552,8 @@ bool mqttConnect() {
   char lwtMessage[128];
   snprintf(lwtMessage, sizeof(lwtMessage), "{\"keybus\":0,\"timestamp\":%lu}", getUnixTimestamp());
   
+  const char* MQTT_USER = deviceId.c_str();
+  
   Serial.printf("[MQTT] Conectando a %s:%d como %s\n", MQTT_HOST, MQTT_PORT, deviceId.c_str());
   
   if (mqtt.connect(deviceId.c_str(), MQTT_USER, MQTT_PASS,
@@ -623,7 +578,7 @@ void printDebugInfo() {
                 WiFi.RSSI());
   Serial.printf("MQTT: %s\n", mqtt.connected() ? "Conectado" : "Desconectado");
   Serial.printf("Keybus: %s\n", dsc.keybusConnected ? "Online" : "Offline");
-  Serial.printf("Código DSC: %s (%d dígitos)\n", customAccessCode, strlen(customAccessCode));
+  Serial.printf("Código DSC: %s\n", customAccessCode);
   Serial.printf("Memoria libre: %d bytes\n", ESP.getFreeHeap());
   Serial.println("================================\n");
 }
