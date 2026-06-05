@@ -1,5 +1,4 @@
 #include <Arduino.h>
-
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
@@ -8,13 +7,17 @@
 #include <time.h>
 #include <ArduinoOTA.h>
 #include <WiFiManager.h>
+#include <Preferences.h>
 
-// ---------- INCLUIR CREDENCIALES ----------
+// ---------- INCLUIR CREDENCIALES MQTT ----------
 #include "credentials.h"
 
 // ---------- CONFIGURACION DINAMICA ----------
 String deviceId = "dsc_" + String((uint32_t)ESP.getEfuseMac(), HEX);
-const char* MQTT_USER = deviceId.c_str();
+
+// ---------- GESTION DE CONFIGURACION ----------
+Preferences preferences;
+char customAccessCode[7] = "1234";     // Soporta 4-6 dígitos + null
 
 // ---------- TOPICOS DINAMICOS ----------
 String TOPIC_STATE;
@@ -26,11 +29,10 @@ String TOPIC_EVENT;
 #define DSC_WRITE_PIN 21
 
 // ---------- BOTON PARA RESET WIFI ----------
-#define WIFI_RESET_BUTTON_PIN 0  // GPIO0 (FLASH button en la mayoría de ESP32)
-#define BUTTON_PRESS_TIME 3000   // 3 segundos para activar reset
+#define WIFI_RESET_BUTTON_PIN 0
+#define BUTTON_PRESS_TIME 5000
 unsigned long buttonPressStart = 0;
 bool buttonPressed = false;
-bool resetWiFiConfig = false;
 
 // ---------- TIMERS ----------
 const unsigned long PUBLISH_INTERVAL = 200;
@@ -39,7 +41,7 @@ bool pendingUpdate = false;
 
 // ---------- NTP ----------
 const char* NTP_SERVER = "pool.ntp.org";
-const long  GMT_OFFSET_SEC = -18000;  // UTC-5 Ecuador
+const long  GMT_OFFSET_SEC = -18000;
 const int   DAYLIGHT_OFFSET_SEC = 0;
 unsigned long lastNTPSync = 0;
 const unsigned long NTP_SYNC_INTERVAL = 3600000;
@@ -51,10 +53,8 @@ WiFiClientSecure secureClient;
 PubSubClient mqtt(secureClient);
 StaticJsonDocument<512> jsonDoc;
 unsigned long lastReconnectAttempt = 0;
-
-// Variables para control de reinicio
 unsigned long lastWiFiCheck = 0;
-const unsigned long WIFI_CHECK_INTERVAL = 60000; // Verificar WiFi cada minuto
+const unsigned long WIFI_CHECK_INTERVAL = 60000;
 
 // ---------- ESTRUCTURA DE CAMBIOS ----------
 struct StateChange {
@@ -70,8 +70,6 @@ struct StateChange {
 };
 
 StateChange stateChange;
-
-// Variables para debug
 unsigned long lastDebugPrint = 0;
 const unsigned long DEBUG_PRINT_INTERVAL = 30000;
 
@@ -89,6 +87,53 @@ unsigned long getUnixTimestamp();
 bool setupWiFi();
 void checkWiFiConnection();
 void checkResetButton();
+void saveConfig();
+void loadConfig();
+
+// ===============================
+void saveConfig() {
+  preferences.begin("dsc_config", false);
+  
+  // Validar que el código tenga entre 4 y 6 dígitos
+  int codeLen = strlen(customAccessCode);
+  if (codeLen >= 4 && codeLen <= 6) {
+    // Verificar que solo tenga dígitos
+    bool valid = true;
+    for (int i = 0; i < codeLen; i++) {
+      if (!isdigit(customAccessCode[i])) {
+        valid = false;
+        break;
+      }
+    }
+    if (valid) {
+      preferences.putString("access_code", customAccessCode);
+      Serial.printf("[Config] Código guardado: %s (%d dígitos)\n", customAccessCode, codeLen);
+    } else {
+      preferences.putString("access_code", "1234");
+      strcpy(customAccessCode, "1234");
+      Serial.println("[Config] Código inválido (solo dígitos), usando 1234");
+    }
+  } else {
+    preferences.putString("access_code", "1234");
+    strcpy(customAccessCode, "1234");
+    Serial.println("[Config] Código inválido (4-6 dígitos), usando 1234");
+  }
+  
+  preferences.end();
+}
+
+// ===============================
+void loadConfig() {
+  preferences.begin("dsc_config", true);
+  
+  String savedCode = preferences.getString("access_code", "1234");
+  strcpy(customAccessCode, savedCode.c_str());
+  
+  preferences.end();
+  
+  Serial.println("[Config] Configuración cargada:");
+  Serial.printf("  Código acceso: %s (%d dígitos)\n", customAccessCode, strlen(customAccessCode));
+}
 
 // ===============================
 void setup() {
@@ -99,30 +144,32 @@ void setup() {
   Serial.println("Iniciando sistema DSC MQTT");
   Serial.println("=========================================");
 
-  // Configurar botón de reset
-  pinMode(WIFI_RESET_BUTTON_PIN, INPUT_PULLUP);
-  Serial.println("[Botón] Configurado GPIO0 para reset WiFi (mantener 3 segundos)");
+  loadConfig();
 
-  // Verificar si el botón está presionado al inicio
+  pinMode(WIFI_RESET_BUTTON_PIN, INPUT_PULLUP);
+  Serial.println("[Botón] Mantener 5 segundos para reset completo");
+
   if (digitalRead(WIFI_RESET_BUTTON_PIN) == LOW) {
-    Serial.println("[Botón] Detectado presionado al inicio - forzando reset de WiFi");
-    resetWiFiConfig = true;
+    Serial.println("[Botón] Reset completo activado");
+    preferences.begin("dsc_config", false);
+    preferences.clear();
+    preferences.end();
+    WiFiManager wifiManager;
+    wifiManager.resetSettings();
+    delay(2000);
+    ESP.restart();
   }
 
-  // Configurar tópicos
   setupTopics();
 
-  // Configurar WiFi con WiFiManager (con opción de reset)
   if (!setupWiFi()) {
     Serial.println("[WiFi] Error crítico, reiniciando...");
     delay(3000);
     ESP.restart();
   }
 
-  // Inicializar NTP
   initNTP();
 
-  // Configuración MQTT
   Serial.println("\n[MQTT] Configurando cliente...");
   secureClient.setCACert(MQTT_CA_CERT);
   secureClient.setHandshakeTimeout(30);
@@ -130,7 +177,6 @@ void setup() {
   mqtt.setCallback(mqttCallback);
   mqtt.setBufferSize(1024);
 
-  // Configurar OTA
   Serial.println("\n[OTA] Configurando actualizaciones...");
   ArduinoOTA.setHostname(deviceId.c_str());
   ArduinoOTA.setPassword("1234");
@@ -162,16 +208,15 @@ void setup() {
   ArduinoOTA.begin();
   Serial.println("[OTA] Listo");
 
-  // Iniciar comunicación con DSC
   Serial.println("\n[DSC] Iniciando comunicación con Keybus...");
   dsc.begin();
   Serial.println("[DSC] Sistema listo");
   
   Serial.println("\n=========================================");
   Serial.println("Sistema iniciado correctamente!");
+  Serial.printf("Código de acceso: %s (%d dígitos)\n", customAccessCode, strlen(customAccessCode));
   Serial.println("=========================================\n");
   
-  // Publicar evento de inicio
   publishEvent("system_start", 0, 0);
 }
 
@@ -179,34 +224,32 @@ void setup() {
 bool setupWiFi() {
   Serial.println("\n[WiFi] Configurando WiFi Manager...");
   
-  // Crear instancia de WiFiManager
   WiFiManager wifiManager;
+  wifiManager.setConfigPortalTimeout(300);
   
-  // Configurar timeout para modo portal (3 minutos)
-  wifiManager.setConfigPortalTimeout(180);
+  String apName = "DSC_" + deviceId.substring(deviceId.length() - 6);
   
-  // Configurar AP name con el deviceId
-  String apName = "DSC_" + deviceId;
+  // Parámetro para el código DSC
+  char codeHint[50];
+  snprintf(codeHint, sizeof(codeHint), "Código DSC (4-6 dígitos) - Actual: %s", customAccessCode);
+  WiFiManagerParameter dsc_code_param("dsc_code", codeHint, customAccessCode, 7);
+  wifiManager.addParameter(&dsc_code_param);
   
   Serial.print("[WiFi] AP Name: ");
   Serial.println(apName);
   
-  // Si se solicitó reset de configuración
-  if (resetWiFiConfig) {
-    Serial.println("[WiFi] Reseteando configuración guardada...");
-    wifiManager.resetSettings();
-    Serial.println("[WiFi] Configuración borrada, iniciando portal de configuración");
-  }
+  // Callback para guardar configuración
+  wifiManager.setSaveParamsCallback([&]() {
+    Serial.println("[WiFiManager] Configuración recibida, guardando código...");
+    strcpy(customAccessCode, dsc_code_param.getValue());
+    saveConfig();
+    Serial.printf("[WiFiManager] Nuevo código: %s\n", customAccessCode);
+  });
   
-  // Intentar conectar automáticamente
   if (wifiManager.autoConnect(apName.c_str(), "dsc12345")) {
     Serial.println("[WiFi] Conectado exitosamente!");
     Serial.print("[WiFi] IP: ");
     Serial.println(WiFi.localIP());
-    Serial.print("[WiFi] MAC: ");
-    Serial.println(WiFi.macAddress());
-    Serial.print("[WiFi] SSID: ");
-    Serial.println(WiFi.SSID());
     return true;
   } else {
     Serial.println("[WiFi] Error: No se pudo conectar");
@@ -216,35 +259,32 @@ bool setupWiFi() {
 
 // ===============================
 void checkResetButton() {
-  // Leer estado del botón (LOW cuando está presionado por el pull-up)
   bool buttonState = (digitalRead(WIFI_RESET_BUTTON_PIN) == LOW);
   
   if (buttonState && !buttonPressed) {
-    // Botón acaba de ser presionado
     buttonPressed = true;
     buttonPressStart = millis();
-    Serial.println("[Botón] Presionado - esperando 3 segundos para reset WiFi...");
+    Serial.println("[Botón] Mantenga 5 segundos para reset completo...");
   } 
   else if (!buttonState && buttonPressed) {
-    // Botón liberado antes de completar el tiempo
     if (millis() - buttonPressStart < BUTTON_PRESS_TIME) {
-      Serial.println("[Botón] Liberado - reset cancelado");
+      Serial.println("[Botón] Reset cancelado");
     }
     buttonPressed = false;
   }
   
-  // Verificar si se mantuvo presionado el tiempo suficiente
   if (buttonPressed && (millis() - buttonPressStart >= BUTTON_PRESS_TIME)) {
-    Serial.println("\n[Botón] Reset WiFi activado! Borrando configuración...");
+    Serial.println("\n[Botón] RESET COMPLETO!");
+    publishEvent("factory_reset", 0, 0);
+    delay(500);
     
-    // Publicar evento de reset
-    publishEvent("wifi_reset_manual", 0, 0);
-    
-    // Borrar configuración WiFi
     WiFiManager wifiManager;
     wifiManager.resetSettings();
     
-    Serial.println("[Botón] Configuración WiFi borrada, reiniciando en 2 segundos...");
+    preferences.begin("dsc_config", false);
+    preferences.clear();
+    preferences.end();
+    
     delay(2000);
     ESP.restart();
   }
@@ -253,7 +293,7 @@ void checkResetButton() {
 // ===============================
 void checkWiFiConnection() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] Conexión perdida, intentando reconectar...");
+    Serial.println("[WiFi] Conexión perdida, reconectando...");
     WiFi.reconnect();
     
     int attempts = 0;
@@ -264,22 +304,10 @@ void checkWiFiConnection() {
     }
     
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\n[WiFi] Reconectado exitosamente!");
+      Serial.println("\n[WiFi] Reconectado!");
       publishEvent("wifi_reconnected", 0, 0);
     } else {
       Serial.println("\n[WiFi] Error: No se pudo reconectar");
-      Serial.println("[WiFi] Activando modo configuración...");
-      
-      // Forzar modo portal para reconectar
-      WiFiManager wifiManager;
-      wifiManager.setConfigPortalTimeout(120);
-      String apName = "DSC_" + deviceId;
-      wifiManager.startConfigPortal(apName.c_str(), "dsc12345");
-      
-      // Después del portal, reiniciar
-      Serial.println("[WiFi] Reiniciando para aplicar cambios...");
-      delay(2000);
-      ESP.restart();
     }
   }
 }
@@ -297,9 +325,7 @@ void setupTopics() {
 
 // ===============================
 void initNTP() {
-  Serial.println("\n[NTP] Inicializando cliente de tiempo...");
-  Serial.println("[NTP] Zona horaria: Ecuador (UTC-5)");
-  
+  Serial.println("\n[NTP] Inicializando...");
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
   
   int attempts = 0;
@@ -312,24 +338,17 @@ void initNTP() {
   
   if (attempts < 10) {
     timeInitialized = true;
-    Serial.println("\n[NTP] Tiempo sincronizado correctamente!");
-    char timeString[64];
-    strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
-    Serial.print("[NTP] Fecha/Hora: ");
-    Serial.println(timeString);
+    Serial.println("\n[NTP] Sincronizado!");
   } else {
-    timeInitialized = false;
-    Serial.println("\n[NTP] Advertencia: No se pudo sincronizar");
+    Serial.println("\n[NTP] No sincronizado, usando uptime");
   }
 }
 
 // ===============================
 String getFormattedTime() {
   if (!timeInitialized) return String(millis());
-  
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return String(millis());
-  
   char timeString[64];
   strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", &timeinfo);
   return String(timeString);
@@ -338,52 +357,42 @@ String getFormattedTime() {
 // ===============================
 unsigned long getUnixTimestamp() {
   if (!timeInitialized) return millis() / 1000;
-  
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return millis() / 1000;
-  
   time_t t = mktime(&timeinfo);
   return (unsigned long)t;
 }
 
 // ===============================
 void loop() {
-  // Verificar botón de reset WiFi
   checkResetButton();
   
-  // Verificar conexión WiFi periódicamente
   if (millis() - lastWiFiCheck >= WIFI_CHECK_INTERVAL) {
     lastWiFiCheck = millis();
     checkWiFiConnection();
   }
   
-  // Manejar OTA
   ArduinoOTA.handle();
   
-  // Sincronizar NTP
   if (millis() - lastNTPSync >= NTP_SYNC_INTERVAL) {
     lastNTPSync = millis();
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 2000)) {
       timeInitialized = true;
-      Serial.println("[NTP] Tiempo resincronizado");
     }
   }
   
-  // Debug periódico
   if (millis() - lastDebugPrint >= DEBUG_PRINT_INTERVAL) {
     lastDebugPrint = millis();
     printDebugInfo();
   }
   
-  // Manejo MQTT
   if (!mqtt.connected()) {
     unsigned long now = millis();
     if (now - lastReconnectAttempt > 5000) {
       lastReconnectAttempt = now;
       if (mqttConnect()) {
         publishState();
-        Serial.println("[MQTT] Reconectado exitosamente");
       }
     }
   } else {
@@ -392,21 +401,22 @@ void loop() {
 
   dsc.loop();
 
-  // Detectar cambios Keybus
   if (dsc.statusChanged) {
     dsc.statusChanged = false;
     stateChange.keybusChanged = true;
     pendingUpdate = true;
-    Serial.println("[DSC] Cambio: Estado Keybus");
   }
 
   if (dsc.accessCodePrompt) {
     dsc.accessCodePrompt = false;
-    dsc.write(ACCESS_CODE);
-    Serial.println("[DSC] Enviando código de acceso");
+    // Enviar el código configurado dígito por dígito
+    for (int i = 0; i < strlen(customAccessCode); i++) {
+      dsc.write(customAccessCode[i]);
+      delay(50); // Pequeña pausa entre dígitos para confiabilidad
+    }
+    Serial.printf("[DSC] Código enviado: %s\n", customAccessCode);
   }
 
-  // Detectar cambios en particiones
   for (byte p = 0; p < 4; p++) {
     if (dsc.disabled[p]) continue;
 
@@ -417,11 +427,9 @@ void loop() {
       if (dsc.armedChanged[p]) {
         const char* eventType = dsc.armed[p] ? "armed" : "disarmed";
         publishEvent(eventType, 0, p);
-        Serial.printf("[DSC] Evento: Partición %d %s\n", p + 1, eventType);
       }
       if (dsc.alarmChanged[p] && dsc.alarm[p]) {
         publishEvent("alarm", 0, p);
-        Serial.printf("[DSC] Evento: ALARMA en partición %d\n", p + 1);
       }
       
       dsc.armedChanged[p] = false;
@@ -430,7 +438,6 @@ void loop() {
     }
   }
 
-  // Detectar cambios en zonas
   if (dsc.openZonesStatusChanged) {
     dsc.openZonesStatusChanged = false;
     stateChange.zonesChanged = true;
@@ -446,12 +453,10 @@ void loop() {
         bool open = bitRead(dsc.openZones[group], bit);
         const char* eventType = open ? "zone_open" : "zone_closed";
         publishEvent(eventType, zone, 0);
-        Serial.printf("[DSC] Evento: Zona %d %s\n", zone, open ? "abierta" : "cerrada");
       }
     }
   }
 
-  // Publicar estado agrupado
   if (pendingUpdate && (millis() - lastPublishTime >= PUBLISH_INTERVAL)) {
     publishState();
     pendingUpdate = false;
@@ -482,7 +487,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   
   if (strcmp(cmd, "arm") == 0 && dsc.ready[partition]) {
     dsc.writePartition = partition + 1;
-    dsc.write('w');
+    dsc.write('a');
     publishEvent("arming", 0, partition);
   }
   else if (strcmp(cmd, "stay") == 0 && dsc.ready[partition]) {
@@ -492,16 +497,35 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
   else if (strcmp(cmd, "disarm") == 0 && (dsc.armed[partition] || dsc.alarm[partition])) {
     dsc.writePartition = partition + 1;
-    dsc.write(ACCESS_CODE);
+    // Usar el código configurado
+    for (int i = 0; i < strlen(customAccessCode); i++) {
+      dsc.write(customAccessCode[i]);
+      delay(50);
+    }
+    Serial.printf("[DSC] Desarmando con código: %s\n", customAccessCode);
     publishEvent("disarming", 0, partition);
   }
   else if (strcmp(cmd, "reset_wifi") == 0) {
-    Serial.println("[MQTT] Comando reset_wifi recibido");
+    Serial.println("[MQTT] Reset remoto recibido");
     publishEvent("wifi_reset_remote", 0, 0);
     WiFiManager wifiManager;
     wifiManager.resetSettings();
     delay(1000);
     ESP.restart();
+  }
+  else if (strcmp(cmd, "set_code") == 0) {
+    const char* newCode = doc["code"];
+    if (newCode) {
+      int newLen = strlen(newCode);
+      if (newLen >= 4 && newLen <= 6) {
+        strcpy(customAccessCode, newCode);
+        saveConfig();
+        Serial.printf("[MQTT] Código actualizado a: %s\n", customAccessCode);
+        publishEvent("code_updated", 0, 0);
+      } else {
+        Serial.printf("[MQTT] Código inválido: debe ser 4-6 dígitos\n");
+      }
+    }
   }
 }
 
@@ -572,7 +596,8 @@ void updateStateJson() {
 
 // ===============================
 bool mqttConnect() {
-  const char* lwtMessage = "{\"keybus\":0}";
+  char lwtMessage[128];
+  snprintf(lwtMessage, sizeof(lwtMessage), "{\"keybus\":0,\"timestamp\":%lu}", getUnixTimestamp());
   
   Serial.printf("[MQTT] Conectando a %s:%d como %s\n", MQTT_HOST, MQTT_PORT, deviceId.c_str());
   
@@ -596,14 +621,9 @@ void printDebugInfo() {
   Serial.printf("WiFi: %s (RSSI: %d dBm)\n", 
                 WiFi.status() == WL_CONNECTED ? "Conectado" : "Desconectado", 
                 WiFi.RSSI());
-  Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
-  Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
   Serial.printf("MQTT: %s\n", mqtt.connected() ? "Conectado" : "Desconectado");
-  Serial.printf("NTP: %s\n", timeInitialized ? "Sincronizado" : "No sincronizado");
-  if (timeInitialized) {
-    Serial.printf("Hora: %s\n", getFormattedTime().c_str());
-  }
   Serial.printf("Keybus: %s\n", dsc.keybusConnected ? "Online" : "Offline");
+  Serial.printf("Código DSC: %s (%d dígitos)\n", customAccessCode, strlen(customAccessCode));
   Serial.printf("Memoria libre: %d bytes\n", ESP.getFreeHeap());
   Serial.println("================================\n");
 }
