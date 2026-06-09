@@ -389,7 +389,7 @@ void loop() {
     Serial.println("[DSC] Enviando código de acceso");
   }
 
-  for (byte p = 0; p < 4; p++) {
+  for (byte p = 0; p < 8; p++) {  // ✅ CAMBIADO: 4 -> 8
     if (dsc.disabled[p]) continue;
 
     if (dsc.armedChanged[p] || dsc.alarmChanged[p] || dsc.readyChanged[p]) {
@@ -397,11 +397,21 @@ void loop() {
       pendingUpdate = true;
       
       if (dsc.armedChanged[p]) {
-        const char* eventType = dsc.armed[p] ? "armed" : "disarmed";
-        publishEvent(eventType, 0, p);
+        if (dsc.armed[p]) {
+          // Armando - diferenciar AWAY/STAY
+          const char* eventType = dsc.armedAway[p] ? "armed" : "stay_armed";
+          publishEvent(eventType, 0, p);
+          Serial.printf("[DSC] Evento: Partición %d %s\n", p + 1, eventType);
+        } else {
+          // Desarmando
+          publishEvent("disarmed", 0, p);
+          Serial.printf("[DSC] Evento: Partición %d DESARMADA\n", p + 1);
+        }
       }
+      
       if (dsc.alarmChanged[p] && dsc.alarm[p]) {
         publishEvent("alarm", 0, p);
+        Serial.printf("[DSC] Evento: ALARMA en partición %d\n", p + 1);
       }
       
       dsc.armedChanged[p] = false;
@@ -503,7 +513,11 @@ void publishEvent(const char* eventType, byte zone, byte partition) {
   jsonDoc["timestamp"] = getUnixTimestamp();
   
   if (zone > 0) jsonDoc["zone"] = zone;
-  if (partition > 0) jsonDoc["partition"] = partition + 1;
+  
+  // ✅ Incluir partición (0 = partición 1, 1 = partición 2, etc.)
+  if (partition <= 7) {
+    jsonDoc["partition"] = partition + 1;
+  }
   
   char buffer[256];
   size_t len = serializeJson(jsonDoc, buffer);
