@@ -17,7 +17,7 @@ String deviceId = "dsc_" + String((uint32_t)ESP.getEfuseMac(), HEX);
 
 // ---------- NUEVO: GESTION DE CONFIGURACION ----------
 Preferences preferences;
-char customAccessCode[7] = "1234";  // Código por defecto
+
 
 // ---------- TOPICOS DINAMICOS ----------
 String TOPIC_STATE;
